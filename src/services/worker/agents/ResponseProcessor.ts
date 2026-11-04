@@ -36,6 +36,9 @@ import { linkAttachmentRefs, type ResponseMediaContext } from '../../media/infer
 import { observationMediaFromMetadata } from '../../media/feed.js';
 import { writeMediaEventResults, writeObservationMediaLinks, type MediaLinkageWriteResult, type ObservationLinkWrite } from '../../media/linkage.js';
 import type { Database } from 'bun:sqlite';
+import { posix, win32 } from 'node:path';
+import { commitBatchOutput, derivedAttribution, retainBatchOutput, quarantineBatch, validateBatchOutput,
+  type ObserverBatch, type ObserverBatchEntry } from '../observer-batch-v2.js';
 
 type ObservationFileEvidenceMessage = Pick<PendingMessage, 'type' | 'tool_name' | 'tool_input'>;
 
@@ -280,8 +283,9 @@ function mergeFileLists(primary: string[], secondary: string[]): string[] {
 }
 
 export interface ResponseContext {
+  batchV2?: ObserverBatch;
   project: string;
-  promptNumber: number;
+  promptNumber: number | null;
   pendingAgentId: string | null;
   pendingAgentType: string | null;
   /**
@@ -518,6 +522,106 @@ export function hasUnfinishedObservationBlock(text: string): boolean {
   return /<observation>/i.test(outsideWholeBlocks);
 }
 
+/** Resolve evidence separately for each cited event. Ambiguous model paths are omitted. */
+export function sanitizeV2ObservationFiles(value: ParsedObservation, entries: ObserverBatchEntry[]): ParsedObservation {
+  const resolveFile = (file: string, cwd: string | null): string | null => {
+    if (win32.isAbsolute(file) || posix.isAbsolute(file)) return file;
+    if (!cwd) return null;
+    return (win32.isAbsolute(cwd) ? win32 : posix).resolve(cwd, file);
+  };
+  const read: string[] = [], modified: string[] = [];
+  for (const entry of entries) {
+    const evidence = extractObservationFileEvidence([entry.message]);
+    read.push(...evidence.files_read.flatMap(file => resolveFile(file, entry.source.cwd) ?? []));
+    modified.push(...evidence.files_modified.flatMap(file => resolveFile(file, entry.source.cwd) ?? []));
+  }
+  const cwdValues = new Set(entries.map(e => e.source.cwd));
+  const cwd = cwdValues.size === 1 ? entries[0].source.cwd : null;
+  return { ...value, files_read: dedupeStable([...read, ...value.files_read.flatMap(file => resolveFile(file, cwd) ?? [])]),
+    files_modified: dedupeStable(modified) };
+}
+
+async function processV2Response(text: string, session: ActiveSession, context: ResponseContext,
+  dbManager: DatabaseManager, sessionManager: SessionManager, worker: WorkerRef | undefined, modelId?: string): Promise<StorageResult | null> {
+  const batch = context.batchV2!;
+  const store = dbManager.getSessionStore();
+  const previous = store.db.prepare('SELECT status FROM observer_batch_runs WHERE batch_id=?').get(batch.id) as {status: string} | null;
+  if (previous?.status === 'committed') { await sessionManager.confirmClaimedMessages(session.sessionDbId, true); return null; }
+  if (previous?.status !== 'sent') return null;
+  retainBatchOutput(store.db, batch, text, { discovery_tokens: 0, usage_pending_result: true });
+  let parsed: ReturnType<typeof validateBatchOutput>;
+  try { parsed = validateBatchOutput(text, batch); }
+  catch {
+    quarantineBatch(store.db, batch, 'attribution_error');
+    sessionManager.quarantineV2Claims(session.sessionDbId, 'attribution_error');
+    worker?.recordAiInteraction?.({ success: false, provider: 'claude', error: 'attribution_error' });
+    logger.error('SDK', 'Observer v2 output quarantined; paid reply retained, no retry', { batchId: batch.id });
+    return null;
+  }
+  const memorySessionId = session.memorySessionId
+    ? store.ensureMemorySessionIdRegistered(session.sessionDbId, session.memorySessionId, getWorkerPort()) || session.memorySessionId
+    : (store.db.prepare('SELECT memory_session_id FROM sdk_sessions WHERE id=?').get(session.sessionDbId) as {memory_session_id:string|null})?.memory_session_id;
+  if (!memorySessionId) throw new Error('Observer v2 has no registered memory session');
+  let committed: ReturnType<typeof commitBatchOutput>;
+  try {
+    committed = commitBatchOutput(store, memorySessionId, batch, parsed, sanitizeV2ObservationFiles, records => {
+      // Each media event is linked only to records that cite its text source. Attachment labels must also resolve within those sources.
+      for (const entry of batch.entries) {
+        const key = entry.message.mediaEventKey;
+        if (!key) continue;
+        const related = records.filter(record => record.entries.some(source => source.label === entry.label));
+        const ids = related.map(record => record.id);
+        writeMediaEventResults(store.db, [key], ids.length ? 'stored' : 'skipped', ids);
+      }
+      if (context.media?.imagesDelivered) {
+        for (const record of records) {
+          const keys = new Set(record.entries.map(e => e.message.mediaEventKey).filter(Boolean));
+          const images = context.media.images.filter(image => keys.has(image.eventKey));
+          const links = linkAttachmentRefs([record.value], images.map(image => ({label: image.requestLabel,event: image.eventOrdinal})));
+          commitTurnMediaLinkage(store.db, {observationIds:[record.id],insertedObservationIds:record.inserted?[record.id]:[],summaryId:null,createdAtEpoch:derivedAttribution(record.entries).timestamp},
+            [links.observations[0]?.refs ?? []], {...context.media,images}, {attributed:[],unattributed:[]}, session.sessionDbId);
+        }
+      }
+    }, modelId);
+  } catch (error) {
+    quarantineBatch(store.db, batch, 'storage_error');
+    sessionManager.quarantineV2Claims(session.sessionDbId, 'storage_error');
+    throw error;
+  }
+  await sessionManager.confirmClaimedMessages(session.sessionDbId, true);
+  session.conversationHistory.push({role:'assistant',content:text});
+  session.pendingAgentId = null; session.pendingAgentType = null;
+  session.lastSummaryStored = committed.summaries.length > 0;
+  session.consecutiveInvalidOutputs = 0;
+  session.consecutiveContextOverflows = 0;
+  if (committed.records.length || committed.summaries.length) {
+    recordObserverSuccess();
+    if (!session.claudeAuthOverride) clearQuotaCooldown('claude');
+  }
+  worker?.recordAiInteraction?.({success:true,provider:'claude'});
+  worker?.broadcastProcessingStatus?.();
+  const result: StorageResult = { observationIds: committed.records.map(r => r.id),
+    insertedObservationIds: committed.records.filter(r => r.inserted).map(r => r.id),
+    summaryId: committed.summaries[0]?.id ?? null, createdAtEpoch: Math.min(...batch.entries.map(e => e.source.occurred_at_epoch)) };
+  // Read canonical fields after reuse so Chroma/SSE sees the same attribution and time as SQLite.
+  for (const record of committed.records) {
+    const row = store.db.prepare('SELECT * FROM observations WHERE id=?').get(record.id) as {
+      prompt_number:number|null;created_at_epoch:number;type:string;title:string|null;subtitle:string|null;narrative:string|null;
+      facts:string;concepts:string;files_read:string;files_modified:string;agent_id:string|null;agent_type:string|null;metadata:string|null };
+    const canonical: ParsedObservation = {type:row.type,title:row.title,subtitle:row.subtitle,narrative:row.narrative,
+      facts:JSON.parse(row.facts),concepts:JSON.parse(row.concepts),files_read:JSON.parse(row.files_read),files_modified:JSON.parse(row.files_modified)};
+    await syncAndBroadcastObservations([canonical], {observationIds:[record.id],insertedObservationIds:record.inserted?[record.id]:[],summaryId:null,createdAtEpoch:row.created_at_epoch},
+      session, {...context,promptNumber:row.prompt_number}, dbManager, worker, 'SDK', memorySessionId);
+  }
+  for (const summary of committed.summaries) {
+    const attrs = derivedAttribution(summary.entries);
+    await syncAndBroadcastSummary(summary.value, normalizeSummaryForStorage(summary.value),
+      {observationIds:[],summaryId:summary.id,createdAtEpoch:attrs.timestamp}, session,
+      {...context,promptNumber:attrs.promptNumber}, dbManager, worker, 'SDK', memorySessionId);
+  }
+  return result;
+}
+
 export async function processAgentResponse(
   text: string,
   session: ActiveSession,
@@ -536,6 +640,7 @@ export async function processAgentResponse(
   const processingStartedAt = Date.now();
   session.lastGeneratorActivity = Date.now();
   const context = responseContext ?? snapshotResponseContext(session);
+  if (context.batchV2) return processV2Response(text, session, context, dbManager, sessionManager, worker, modelId);
   // Scoped to the reply that produced `text`: consumed here, before any branch,
   // so a later reply (from any provider) never reads one an earlier turn set.
   const finishReason = session.lastFinishReason ?? null;
@@ -870,7 +975,7 @@ export async function processAgentResponse(
       context.project,
       labeledObservations,
       summaryForStore,
-      context.promptNumber,
+      context.promptNumber ?? undefined,
       discoveryTokens,
       originalTimestamp ?? undefined,
       modelId

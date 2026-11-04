@@ -14,7 +14,7 @@ import { normalizePlatformSource } from '../../../shared/platform-source.js';
 import { PrivacyCheckValidator } from '../validation/PrivacyCheckValidator.js';
 import { captureEvent } from '../../telemetry/telemetry.js';
 import { classifySkillId, skillNameFromToolInput } from '../../telemetry/skill-id.js';
-import { isRecursiveMemoryTool, isExplicitMemoryWrite } from '../../../shared/memory-retrieval-tools.js';
+import { isRecursiveMemoryTool, isExplicitMemoryWrite, isInternalMemoryObserverTool } from '../../../shared/memory-retrieval-tools.js';
 import { workStateTool } from '../../../shared/work-state-telemetry.js';
 import { recordWorkStateTool, isPublicWorkStateTurn } from '../../telemetry/work-state.js';
 import { AGENT_LIFECYCLE_LIST, agentStopFields } from '../../work-view/agent-lifecycle.mjs';
@@ -188,6 +188,10 @@ export async function ingestObservation(payload: ObservationPayload, handoff: In
   const project = projectContext?.primary || 'unknown';
 
   const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+
+  if (settings.CLAUDE_MEM_OBSERVER_SKIP_INTERNAL_TOOLS === 'true' && isInternalMemoryObserverTool(payload.toolName)) {
+    return { ok: true, status: 'skipped', reason: 'internal_memory_tool' };
+  }
 
   if (cwd && isProjectExcluded(cwd, settings.CLAUDE_MEM_EXCLUDED_PROJECTS)) {
     return { ok: true, status: 'skipped', reason: 'project_excluded' };

@@ -16,6 +16,7 @@ export interface ConversationMessage {
 }
 
 export interface ActiveSession {
+  observerV2Batch?: import('./worker/observer-batch-v2.js').ObserverBatch;
   sessionDbId: number;
   contentSessionId: string;      
   memorySessionId: string | null; 
@@ -236,6 +237,10 @@ export interface ActiveSession {
 }
 
 export interface PendingMessage {
+  /** Frozen durable provenance; never inferred from the observer's current agent. */
+  _source?: import('./worker/observer-batch-v2.js').ObserverSource;
+  _fragmentIndex?: number;
+  _fragmentCount?: number;
   mediaRefs?: MediaAttachmentRef[];
   mediaEventKey?: string;
   mediaFailures?: MediaFailureDescriptor[];

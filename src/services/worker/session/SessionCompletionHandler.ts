@@ -28,7 +28,9 @@ export class SessionCompletionHandler {
 
     // The in-RAM message buffer is dropped when the session is removed
     // (SessionManager.removeSessionImmediate/deleteSession → buffer.dispose),
-    // so there is nothing durable to clear here.
+    // so there is nothing to clear here. In opt-in deferred mode SessionManager
+    // retains waiting outbox rows and records released-row dispositions itself;
+    // finalizing a generation must not erase a later waiting boundary.
 
     this.eventBroadcaster.broadcastSessionCompleted(sessionDbId);
 

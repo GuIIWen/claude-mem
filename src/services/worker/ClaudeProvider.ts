@@ -42,6 +42,7 @@ import {
   describeGenerationUsage,
   resolveConversationMaxChars,
   windowAwareConversationMaxChars,
+  generationUsageChars,
 } from '../../shared/observer-recycle.js';
 import { resolveContextWindowTokens, observationFieldMaxChars } from './context-window.js';
 import { recycleObserverConversation, loadSessionStartContext, openObserverGeneration, observesBarePrompts } from './session/recycle-conversation.js';
@@ -57,6 +58,7 @@ import { captureEvent } from '../telemetry/telemetry.js';
 import { clearDependencyStatus, recordClaudeCliSetupRequired, OBSERVER_DIR_UNUSABLE_CODE } from '../../shared/dependency-health.js';
 import { clearClaudeCliSelfHealAttempts } from './stale-spawn-recovery.js';
 import { paidSendBudgetForClaimedBatch } from './paid-send-budget.js';
+import { beginBatch, buildV2InitPrompt, makeBatchEntry, newBatchId, renderBatch, quarantineBatch, type ObserverBatch, type ObserverBatchEntry } from './observer-batch-v2.js';
 
 /**
  * Module-scoped guard so the "effort parameter" hint only fires once per
@@ -508,6 +510,7 @@ export class ClaudeProvider {
       // without one still needs the idle hand-off, otherwise the claimed batch
       // is left dangling for session teardown to discard.
       let turnDispatchedText = false;
+      let v2TurnText = '';
       // Shape of the turn's last textless frame (block kinds only, never
       // content), so an idle hand-off can say WHY the turn was empty (#3454).
       let turnEmptyOutputReason: string | undefined;
@@ -712,6 +715,12 @@ export class ClaudeProvider {
           const reportedModel = message.message.model;
           const servedModel = typeof reportedModel === 'string' && reportedModel ? reportedModel : modelId;
 
+          if (activeResponseContext.current.batchV2) {
+            v2TurnText += textContent;
+            turnDispatchedText = true;
+            continue;
+          }
+
           pacer.processingStarted();
           try {
             const stored = await processAgentResponse(
@@ -781,7 +790,7 @@ export class ClaudeProvider {
                 session.cumulativeCacheReadTokens =
                   (session.cumulativeCacheReadTokens ?? 0) + resultUsage.cache_read_input_tokens;
               }
-              if (turnInsertedObservationIds.length > 0 || turnSummaryId !== null) {
+              if (!activeResponseContext.current.batchV2 && (turnInsertedObservationIds.length > 0 || turnSummaryId !== null)) {
                 this.dbManager.getSessionStore().updateDiscoveryTokens(
                   turnInsertedObservationIds,
                   turnSummaryId,
@@ -795,6 +804,14 @@ export class ClaudeProvider {
           turnSummaryId = null;
 
           const totalCostUsd = (message as any).total_cost_usd as number | undefined;
+          if (activeResponseContext.current.batchV2) {
+            this.dbManager.getSessionStore().db.prepare('UPDATE observer_batch_runs SET usage_json=?,request_id=? WHERE batch_id=?')
+              .run(JSON.stringify({ ...resultUsage, total_cost_usd: totalCostUsd }),
+                (message as { uuid?: string }).uuid ?? null, activeResponseContext.current.batchV2.id);
+            logger.info('SDK', 'OBSERVER_RESULT_V2', { batchId: activeResponseContext.current.batchV2.id,
+              requestKind: activeResponseContext.current.batchV2.requestKind, attempt: 1, usage: resultUsage,
+              requestId: (message as { uuid?: string }).uuid ?? null });
+          }
           let turnCostUsd: number | undefined;
           if (typeof totalCostUsd === 'number') {
             const prior = session.lastResultTotalCostUsd ?? 0;
@@ -824,6 +841,19 @@ export class ClaudeProvider {
           const resultSubtype = (message as any).subtype as string | undefined;
           const resultIsError = (message as any).is_error === true || resultSubtype !== 'success';
 
+          if (activeResponseContext.current.batchV2) {
+            pacer.processingStarted();
+            try {
+              await processAgentResponse(v2TurnText, session, this.dbManager, this.sessionManager, worker, 0,
+                session.earliestPendingTimestamp, 'SDK', cwdTracker.lastCwd, modelId, activeResponseContext.current);
+            } catch (error) { responseProcessingThrew = true; throw error; }
+            finally { pacer.processingFinished(); }
+            v2TurnText = '';
+            turnDispatchedText = false;
+            pacer.answer();
+            continue;
+          }
+
           // The turn is over and the model never emitted text. Only a
           // successful turn means the model read the batch — forward its empty
           // answer once, and ResponseProcessor holds it to the skip contract
@@ -850,7 +880,7 @@ export class ClaudeProvider {
               typeof (message as any).result === 'string' ? (message as any).result : '',
               ...(((message as any).errors as string[] | undefined) ?? []),
             ].join('\n');
-            if (resultIsError && !session.observerThinkingStripped && isThinkingRejectFeedback(resultErrorFeedback)) {
+            if (resultIsError && !activeResponseContext.current.batchV2 && !session.observerThinkingStripped && isThinkingRejectFeedback(resultErrorFeedback)) {
               session.observerThinkingStripped = true;
               logger.warn('SDK', 'Upstream rejected the thinking parameter; retrying the next generation with it stripped (#4732)', {
                 sessionId: session.sessionDbId,
@@ -865,7 +895,7 @@ export class ClaudeProvider {
               }
               break;
             }
-            if (resultIsError && !retriedAfterErrorResult) {
+            if (resultIsError && !activeResponseContext.current.batchV2 && !retriedAfterErrorResult) {
               retriedAfterErrorResult = true;
               logger.warn('SDK', 'SDK turn failed before emitting text, re-queueing the claimed batch', {
                 sessionId: session.sessionDbId,
@@ -924,6 +954,7 @@ export class ClaudeProvider {
         await this.releaseClaimedBatchForTransportExit(session, 'transport:sdk_eof');
       }
     } catch (error) {
+      this.quarantineUncertainV2Batch(session);
       // A missing binary (ENOENT) or a Windows .cmd/.bat shim that cannot be
       // launched without a shell (EINVAL) surfaces here as a raw spawn error.
       // Left unclassified it is a generic failure, retried on every later
@@ -1023,6 +1054,7 @@ export class ClaudeProvider {
    * idle, shutdown) is never overwritten: callers check before calling.
    */
   private async releaseClaimedBatchForTransportExit(session: ActiveSession, reason: string): Promise<void> {
+    this.quarantineUncertainV2Batch(session);
     session.abortReason = reason;
     logger.warn('SDK', 'SDK stream ended without a result; preserving the claimed batch for the next generation', {
       sessionId: session.sessionDbId,
@@ -1048,6 +1080,12 @@ export class ClaudeProvider {
         message: `The Claude SDK stream ended ${MAX_CONSECUTIVE_SDK_STREAM_EXITS} times in a row without answering queued work`,
       });
     }
+  }
+
+  private quarantineUncertainV2Batch(session: ActiveSession): void {
+    if (!session.observerV2Batch || !session.claimedMessageIds.length) return;
+    quarantineBatch(this.dbManager.getSessionStore().db, session.observerV2Batch, 'uncertain_send');
+    this.sessionManager.quarantineV2Claims(session.sessionDbId, 'uncertain_send');
   }
 
   /** One bounded, standalone SDK call on the same Observer provider path. */
@@ -1197,7 +1235,9 @@ export class ClaudeProvider {
     // session gets, so a conversation that starts partway through continues from
     // the memory rather than from nothing (#3800).
     const priorContext = await loadSessionStartContext(session, cwdTracker.lastCwd);
-    const initPrompt = isInitPrompt
+    const v2Enabled = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_CLAUDE_BATCH_V2_ENABLED === 'true'
+      && this.sessionManager.hasDeferredObserver();
+    const initPrompt = v2Enabled ? buildV2InitPrompt(session.project, session.userPrompt, priorContext, mode.observation_types.map(t => t.id)) : isInitPrompt
       ? buildInitPrompt(session.project, session.contentSessionId, session.userPrompt, mode, priorContext)
       : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode, priorContext);
     activeResponseContext.current = snapshotResponseContext(session);
@@ -1207,7 +1247,7 @@ export class ClaudeProvider {
 
     // By default the init prompt is not a turn of its own: it goes out in the
     // same message as the first observation or summary prompt.
-    const observeBarePrompt = observesBarePrompts();
+    const observeBarePrompt = !v2Enabled && observesBarePrompts();
     let pendingInitPrompt: string | null = observeBarePrompt ? null : initPrompt;
     const withPendingInitPrompt = (prompt: string): string => {
       if (pendingInitPrompt === null) return prompt;
@@ -1243,6 +1283,57 @@ export class ClaudeProvider {
 
       if (message.cwd) {
         cwdTracker.lastCwd = message.cwd;
+      }
+
+      if (v2Enabled && message._source) {
+        const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+        const configured = Math.min(96000, Math.max(12000, Number(settings.CLAUDE_MEM_CLAUDE_BATCH_V2_MAX_CHARS) || 96000));
+        const used = generationUsageChars(session.conversationHistory, session.lastContextTokens);
+        // Reserve the next whole batch and output before recycling, with no empty init send.
+        if (used + configured > this.conversationMaxChars(session) && session.conversationHistory.length > 1) {
+          await recycleObserverConversation(session, this.sessionManager, worker, 'budget', describeGenerationUsage(session.conversationHistory, session.lastContextTokens));
+          return;
+        }
+        const windowRemaining = session.observerContextWindowTokens
+          ? session.observerContextWindowTokens * 4 - used - 48000 : configured;
+        const maxChars = Math.min(configured, windowRemaining);
+        const initChars = pendingInitPrompt === null ? 0 : pendingInitPrompt.length + 2;
+        const id = newBatchId();
+        const entries: ObserverBatchEntry[] = [makeBatchEntry(message, 1, id, session.project, session.sessionDbId)];
+        let reason = 'queue_drained';
+        if (renderBatch(entries).length + initChars > maxChars) {
+          // No paid request. The original payload remains available for a smaller fragment policy.
+          this.sessionManager.quarantineV2Claims(session.sessionDbId, 'input_budget_requires_refragment');
+          const db = this.dbManager.getSessionStore().db;
+          db.prepare(`UPDATE observer_deferred_outbox SET state='parked',reason='input_budget_requires_refragment' WHERE id=? AND state!='done'`).run(message._source.event_id);
+          return;
+        }
+        while (entries.length < 64) {
+          const next = this.sessionManager.claimNextV2Message(session.sessionDbId, candidate => {
+            if (!candidate._source || candidate._source.project !== session.project || candidate._source.session_db_id !== session.sessionDbId) { reason = 'identity_boundary'; return false; }
+            if (candidate.type === 'observation' && entries.filter(e => e.message.type === 'observation').length >= 16) { reason = 'event_limit'; return false; }
+            const entry = makeBatchEntry(candidate, entries.length + 1, id, session.project, session.sessionDbId);
+            if (renderBatch([...entries, entry]).length + initChars > maxChars) { reason = 'input_budget'; return false; }
+            return true;
+          });
+          if (!next) break;
+          entries.push(makeBatchEntry(next, entries.length + 1, id, session.project, session.sessionDbId));
+        }
+        const tools = entries.filter(e => e.message.type === 'observation').length;
+        const batch: ObserverBatch = { id, project: session.project, sessionDbId: session.sessionDbId, entries,
+          prompt: withPendingInitPrompt(renderBatch(entries)), reason,
+          requestKind: tools === 0 ? 'summary' : tools === entries.length ? 'observation' : 'mixed' };
+        beginBatch(this.dbManager.getSessionStore().db, batch);
+        session.observerV2Batch = batch;
+        activeResponseContext.current = { ...snapshotResponseContext(session), batchV2: batch };
+        session.conversationHistory.push({ role: 'user', content: batch.prompt });
+        session.lastPromptSentAt = Date.now();
+        session.lastGeneratorSource = tools ? 'ingest' : 'summarize';
+        answeredBeforeSend = pacer.mark();
+        yield { type: 'user', message: { role: 'user', content: batch.prompt }, session_id: session.contentSessionId,
+          parent_tool_use_id: null, isSynthetic: true };
+        if (!(await this.awaitObserverAnswer(session, pacer, answeredBeforeSend))) return;
+        continue;
       }
 
       if (message.type === 'observation') {
@@ -1417,6 +1508,7 @@ export class ClaudeProvider {
       // The unanswered prompt may have been billed: it counts against the
       // batch's paid-send budget, read before the reset forgets the claims.
       paidSendBudgetForClaimedBatch(session)?.recordPaidSend();
+      this.quarantineUncertainV2Batch(session);
       try {
         session.abortController.abort();
       } catch {

@@ -13,6 +13,11 @@ import { planUnattendedGatewayResume, unattendedGatewayResumesSpent } from './se
 import { PROVIDER_SWITCH_BOUNDARY_ABORT_REASON } from './session/abort-reason.js';
 import { isSimpleTierMessage } from './session/tier-routing.js';
 import { claudeStandInStillServes } from '../../shared/claude-fallback-readiness.js';
+import type { Database } from 'bun:sqlite';
+import { DeferredObserverQueue, observerMaxWaitMs, type DeferredObserverClock, type DeferredObserverRow } from './DeferredObserverQueue.js';
+import { freezeSource, prepareEventFragments, type ObserverSource } from './observer-batch-v2.js';
+import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
+import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 
 export const SESSION_END_WRAPUP_GRACE_MS = 5_000;
 
@@ -60,6 +65,9 @@ export class SessionManager {
   private transportResumeDispositionEpochs = new WeakMap<ActiveSession, number>();
   /** Sessions that already used their one summarize rescue (#3419). */
   private readonly summarizeRescues = new Set<number>();
+  private deferredObserver?: DeferredObserverQueue;
+  private readonly deferredMessageIds = new Map<number, number>();
+  private deferredShuttingDown = false;
 
   constructor(
     dbManager: DatabaseManager,
@@ -76,6 +84,53 @@ export class SessionManager {
     this.generatorStarter = starter;
   }
 
+  hasDeferredObserver(): boolean { return this.deferredObserver !== undefined; }
+
+  /** Called once at worker boot, after DB and generator admission are ready. */
+  configureDeferredObserver(
+    db: Database,
+    settings: { CLAUDE_MEM_OBSERVER_TRIGGER?: string; CLAUDE_MEM_OBSERVER_MAX_WAIT_MS?: string },
+    clock?: DeferredObserverClock,
+  ): void {
+    if (settings.CLAUDE_MEM_OBSERVER_TRIGGER !== 'summary_or_session_end') return;
+    if (this.deferredObserver) throw new Error('Deferred observer already configured');
+    this.deferredObserver = new DeferredObserverQueue(db, observerMaxWaitMs(settings.CLAUDE_MEM_OBSERVER_MAX_WAIT_MS),
+      (rows, source) => this.releaseDeferredMessages(rows, source), clock);
+    this.deferredObserver.recover();
+  }
+
+  private releaseDeferredMessages(rows: DeferredObserverRow[], source: string): void {
+    const sessions = new Set<number>();
+    for (const row of rows) {
+      const session = this.initializeSession(row.session_db_id);
+      const message = JSON.parse(row.message_json) as PendingMessage;
+      const db = this.dbManager.getSessionStore().db;
+      message._source = row.source_meta_json ? JSON.parse(row.source_meta_json) as ObserverSource
+        : freezeSource(row.id, row.session_db_id, session.project, message, row.enqueued_at);
+      if (!row.source_meta_json) db.prepare('UPDATE observer_deferred_outbox SET source_meta_json=? WHERE id=? AND source_meta_json IS NULL')
+        .run(JSON.stringify(message._source), row.id);
+      const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+      const messages = settings.CLAUDE_MEM_CLAUDE_BATCH_V2_ENABLED === 'true'
+        ? prepareEventFragments(db, row.id, message, Number(settings.CLAUDE_MEM_CLAUDE_BATCH_V2_MAX_CHARS) || 96000) : [message];
+      for (const part of messages) {
+        const bufferId = this.buffer.enqueue(row.session_db_id, part, row.enqueued_at);
+        if (bufferId) this.deferredMessageIds.set(bufferId, row.id);
+      }
+      sessions.add(row.session_db_id);
+    }
+    for (const sessionDbId of sessions) {
+      void Promise.resolve().then(() => this.generatorStarter?.(sessionDbId, source)).catch(error => {
+        logger.error('SESSION', 'Deferred observer admission failed; released work retained', { sessionId: sessionDbId },
+          error instanceof Error ? error : new Error(String(error)));
+      });
+    }
+  }
+
+  private markDeferredInflight(bufferId: number): void {
+    const outboxId = this.deferredMessageIds.get(bufferId);
+    if (outboxId !== undefined) this.deferredObserver?.markInflight(outboxId);
+  }
+
   /**
    * Park the last-sent batch when its PaidSendBudget is spent: it is never
    * resent, by any path, and stays visible in the buffer (getParkedMessages)
@@ -88,6 +143,10 @@ export class SessionManager {
     session.paidSendBudget = undefined;
     const parkedMessageIds = this.buffer.park(session.sessionDbId, [...budget.batchMessageIds], budget.clientAttemptId);
     if (parkedMessageIds.length > 0) {
+      for (const id of parkedMessageIds) {
+        const outboxId = this.deferredMessageIds.get(id);
+        if (outboxId !== undefined) this.deferredObserver?.park(outboxId, `paid_send_budget:${budget.clientAttemptId}`);
+      }
       logger.error('SESSION', 'Batch parked: its paid-send budget is spent, so it is not resent', {
         sessionId: session.sessionDbId,
         parkedMessageIds,
@@ -441,6 +500,11 @@ export class SessionManager {
 
   /** SessionEnd is the sole producer of this marker; Stop only queues a summary. */
   async requestSessionWrapup(sessionDbId: number): Promise<void> {
+    if (this.deferredObserver?.needsSummary(sessionDbId)) {
+      // SessionEnd is a boundary even for hosts that never emitted Stop.
+      // Queue the summary after the waiting observations, then release both.
+      this.queueSummarize(sessionDbId);
+    }
     const session = this.getSession(sessionDbId);
     if (!session) {
       this.deliverSessionWrapupInBackground(sessionDbId);
@@ -494,8 +558,10 @@ export class SessionManager {
       ...(data.mediaFailures ? { mediaFailures: data.mediaFailures } : {}),
     };
 
-    const messageId = this.buffer.enqueue(sessionDbId, message, enqueuedAtEpochMs);
-    const queueDepth = this.buffer.getPendingCount(sessionDbId);
+    const messageId = this.deferredObserver
+      ? this.deferredObserver.enqueue(sessionDbId, message, enqueuedAtEpochMs, session.project)
+      : this.buffer.enqueue(sessionDbId, message, enqueuedAtEpochMs);
+    const queueDepth = this.buffer.getPendingCount(sessionDbId) + (this.deferredObserver?.getWaitingCount(sessionDbId) ?? 0);
     const toolSummary = redactForLog(logger.formatTool(data.tool_name, data.tool_input));
     if (messageId === 0) {
       logger.debug('QUEUE', `DUP_SUPPRESSED | sessionDbId=${sessionDbId} | type=observation | tool=${toolSummary} | toolUseId=${data.toolUseId ?? 'null'} | depth=${queueDepth}`, {
@@ -526,8 +592,11 @@ export class SessionManager {
       last_assistant_message: lastAssistantMessage
     };
 
-    const messageId = this.buffer.enqueue(sessionDbId, message, enqueuedAtEpochMs);
-    const queueDepth = this.buffer.getPendingCount(sessionDbId);
+    const messageId = this.deferredObserver
+      ? this.deferredObserver.enqueue(sessionDbId, message, enqueuedAtEpochMs, session.project)
+      : this.buffer.enqueue(sessionDbId, message, enqueuedAtEpochMs);
+    this.deferredObserver?.flush(sessionDbId, 'deferred-summary');
+    const queueDepth = this.buffer.getPendingCount(sessionDbId) + (this.deferredObserver?.getWaitingCount(sessionDbId) ?? 0);
     if (messageId === 0) {
       logger.debug('QUEUE', `DUP_SUPPRESSED | sessionDbId=${sessionDbId} | type=summarize | depth=${queueDepth}`, {
         sessionId: sessionDbId
@@ -540,6 +609,8 @@ export class SessionManager {
   }
 
   async clearPendingForSession(sessionDbId: number): Promise<number> {
+    this.deferredObserver?.cancelSession(sessionDbId);
+    this.forgetDeferredBufferMappings(sessionDbId);
     return this.buffer.clear(sessionDbId);
   }
 
@@ -551,11 +622,16 @@ export class SessionManager {
     return this.buffer.resetClaimed(sessionDbId);
   }
 
-  async confirmClaimedMessages(sessionDbId: number): Promise<number> {
+  async confirmClaimedMessages(sessionDbId: number, durableAlreadyCommitted = false): Promise<number> {
     const session = this.sessions.get(sessionDbId);
     const claimedIds = session?.claimedMessageIds ?? [];
     let confirmed = 0;
     for (const messageId of claimedIds) {
+      const outboxId = this.deferredMessageIds.get(messageId);
+      if (outboxId !== undefined) {
+        if (!durableAlreadyCommitted) this.deferredObserver?.confirm(outboxId);
+        this.deferredMessageIds.delete(messageId);
+      }
       confirmed += this.buffer.confirm(messageId);
     }
     if (session) {
@@ -580,6 +656,29 @@ export class SessionManager {
     const session = this.sessions.get(sessionDbId);
     const claimedIds = session?.claimedMessageIds ?? [];
     return this.buffer.getMessagesByIds(sessionDbId, claimedIds);
+  }
+
+  /** V2 claims summaries too, while the buffer still enforces a strict session FIFO. */
+  claimNextV2Message(sessionDbId: number, accepts: (message: PendingMessageWithId) => boolean): PendingMessageWithId | null {
+    const session = this.sessions.get(sessionDbId);
+    if (!session || session.abortController.signal.aborted) return null;
+    const message = this.buffer.claimNextMatching(sessionDbId, candidate => !this.leavesSimpleTier(session, candidate) && accepts(candidate));
+    if (message) {
+      this.markDeferredInflight(message._persistentId);
+      session.claimedMessageIds.push(message._persistentId);
+    }
+    return message;
+  }
+
+  quarantineV2Claims(sessionDbId: number, reason: string): void {
+    const session = this.sessions.get(sessionDbId);
+    if (!session) return;
+    const outboxIds = new Set(session.claimedMessageIds.map(id => this.deferredMessageIds.get(id)).filter(id => id !== undefined));
+    // A rejected fragment quarantines the entire original event, including unsent RAM fragments.
+    const affectedIds = [...this.deferredMessageIds].filter(([, eventId]) => outboxIds.has(eventId)).map(([bufferId]) => bufferId);
+    this.buffer.park(sessionDbId, [...session.claimedMessageIds, ...affectedIds], reason);
+    session.claimedMessageIds = [];
+    session.earliestPendingTimestamp = null;
   }
 
   async deleteSession(sessionDbId: number): Promise<void> {
@@ -732,15 +831,26 @@ export class SessionManager {
   private disposeSessionBuffer(sessionDbId: number): void {
     const pendingCount = this.buffer.getPendingCount(sessionDbId);
     if (pendingCount > 0) {
-      logger.warn('SESSION', 'Discarding pending session messages', {
+      logger.warn('SESSION', this.deferredObserver ? 'Removing RAM messages; deferred outbox retains their disposition' : 'Discarding pending session messages', {
         sessionId: sessionDbId,
         pendingCount,
       });
     }
+    this.forgetDeferredBufferMappings(sessionDbId, !this.deferredShuttingDown);
     this.buffer.dispose(sessionDbId);
   }
 
+  private forgetDeferredBufferMappings(sessionDbId: number, park = false): void {
+    for (const message of this.buffer.getMessagesByIds(sessionDbId, [...this.deferredMessageIds.keys()])) {
+      const outboxId = this.deferredMessageIds.get(message._persistentId);
+      if (park && outboxId !== undefined) this.deferredObserver?.park(outboxId, 'session_removed_before_confirmation');
+      this.deferredMessageIds.delete(message._persistentId);
+    }
+  }
+
   async shutdownAll(): Promise<void> {
+    this.deferredShuttingDown = true;
+    this.deferredObserver?.stop();
     const sessionIds = Array.from(this.sessions.keys());
     const pendingCountAtShutdownStart = sessionIds.reduce((total, id) => total + this.buffer.getPendingCount(id), 0);
     if (pendingCountAtShutdownStart > 0) {
@@ -815,7 +925,7 @@ export class SessionManager {
   }
 
   getTotalQueueDepth(): number {
-    return this.buffer.getTotalDepth();
+    return this.buffer.getTotalDepth() + (this.deferredObserver?.getWaitingCount() ?? 0);
   }
 
   /** See SessionMessageBuffer.getLastAssignedId. */
@@ -883,6 +993,7 @@ export class SessionManager {
         return;
       }
       session.claimedMessageIds.push(message._persistentId);
+      this.markDeferredInflight(message._persistentId);
       if (session.earliestPendingTimestamp === null) {
         session.earliestPendingTimestamp = message._originalTimestamp;
       } else {
@@ -911,6 +1022,7 @@ export class SessionManager {
         && !this.leavesSimpleTier(session, candidate)
         && accepts(candidate));
     if (message) {
+      this.markDeferredInflight(message._persistentId);
       session.claimedMessageIds.push(message._persistentId);
       session.earliestPendingTimestamp = Math.min(session.earliestPendingTimestamp ?? message._originalTimestamp, message._originalTimestamp);
     }

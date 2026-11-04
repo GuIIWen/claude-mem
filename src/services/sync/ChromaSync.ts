@@ -114,7 +114,7 @@ export interface StoredObservation {
   concepts: string | null; 
   files_read: string | null;
   files_modified: string | null;
-  prompt_number: number;
+  prompt_number: number | null;
   created_at_epoch: number;
 }
 
@@ -130,7 +130,7 @@ export interface StoredSummary {
   completed: string | null;
   next_steps: string | null;
   notes: string | null;
-  prompt_number: number;
+  prompt_number: number | null;
   created_at_epoch: number;
 }
 
@@ -979,7 +979,7 @@ export class ChromaSync {
     memorySessionId: string,
     project: string,
     obs: ParsedObservation & { text?: string | null; merged_into_project?: string | null },
-    promptNumber: number,
+    promptNumber: number | null,
     createdAtEpoch: number,
     platformSource?: string,
     replaceExisting = false,
@@ -1051,7 +1051,7 @@ export class ChromaSync {
     memorySessionId: string,
     project: string,
     summary: ParsedSummary & { merged_into_project?: string | null },
-    promptNumber: number,
+    promptNumber: number | null,
     createdAtEpoch: number,
     platformSource?: string,
     replaceExisting = false,

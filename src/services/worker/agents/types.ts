@@ -24,7 +24,7 @@ export interface ObservationSSEPayload {
   files_read: string;  
   files_modified: string;  
   project: string;
-  prompt_number: number;
+  prompt_number: number | null;
   created_at_epoch: number;
   /** Validated media refs, identical to the paged/by-id feeds; absent for image-free rows. */
   media?: MediaManifest;
@@ -41,7 +41,7 @@ export interface SummarySSEPayload {
   next_steps: string | null;
   notes: string | null;
   project: string;
-  prompt_number: number;
+  prompt_number: number | null;
   created_at_epoch: number;
 }
 

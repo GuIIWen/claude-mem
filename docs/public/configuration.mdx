@@ -56,6 +56,45 @@ Settings are managed in `~/.claude-mem/settings.json`. The file is auto-created 
 | `CLAUDE_MEM_REDACT_CUSTOM_PATTERNS` | `[]`                      | JSON array of extra `{ "name", "regex" }` patterns, evaluated before the built-ins so they can override a token family |
 | `CLAUDE_MEM_REDACT_LOG_MATCHES` | `false`                       | Log a `pattern,count` line per redaction scan (the matched bytes are never logged) |
 
+### Deferred observer processing
+
+The default `CLAUDE_MEM_OBSERVER_TRIGGER=immediate` preserves immediate observer
+processing. To collect tool events until a turn or session boundary, set:
+
+```json
+{
+  "CLAUDE_MEM_OBSERVER_TRIGGER": "summary_or_session_end",
+  "CLAUDE_MEM_OBSERVER_MAX_WAIT_MS": "1800000",
+  "CLAUDE_MEM_OBSERVER_SKIP_INTERNAL_TOOLS": "true",
+  "CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE": "16",
+  "CLAUDE_MEM_OPENAI_COMPAT_OBSERVATION_BATCH_SIZE": "16"
+}
+```
+
+Restart the worker to apply the trigger and maximum wait settings. Tool events
+are held in a local SQLite outbox until Stop/summary, SessionEnd, or **30 minutes
+after the oldest waiting event**. New events do not postpone that deadline.
+Set the maximum wait to `0` to wait indefinitely for a boundary. Batch size only
+limits events per observer prompt; reaching 16 does not trigger processing.
+Existing prompt/agent/working-directory and size barriers still apply, so one
+flush may require init, several observation requests, and a summary request.
+
+Events arriving after a flush snapshot wait for the next boundary/deadline, even
+when an observer is already running. Unsent events and their original times
+survive worker restarts. Shutdown preserves them without flushing. Sent but
+unconfirmed events are quarantined as `parked` after a restart, with reason
+`restart_after_uncertain_send`; they are retained for operator inspection and
+are **not automatically sent again**. The queue does not reintroduce the old
+`pending_messages` replay mechanism. Deleting a session also deletes its queued
+payloads through the database foreign key.
+
+`CLAUDE_MEM_OBSERVER_SKIP_INTERNAL_TOOLS` defaults to `false`. When enabled it
+skips the observer echo of claude-mem's own retrieval and `work_state_*` tools.
+Tool execution, explicit work-state writes, saved memories, and business MCP
+tools continue normally. This toggle can be read on the next capture without a
+restart. Delayed processing saves repeated observer turns at the cost of delayed
+memory availability; actual savings depend on workload and provider caching.
+
 ### Subagent & Dynamic Workflow filtering
 
 Claude Code [Dynamic Workflows](https://code.claude.com/docs/en/workflows) fan a single
@@ -190,9 +229,21 @@ Thresholds are fractions from 0 to 1 (`0.93` = 93%). A value outside that range,
 
 These apply to every observer provider. The observer's conversation runs in generations. When one fills its budget, claude-mem retires it and starts a fresh one, briefed with the session's own observations. The budget is the smaller of `CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS` and half the observer model's context window (about 4 characters per token). Each tool call's parameters and outcome are capped at a tenth of the window, 16,000 characters at most.
 
+Claude's opt-in v2 mode sends long fields directly within the total input budget,
+without a separate model compression request. Oversized events use a durable
+fragment ledger; the original event completes after every fragment is confirmed.
+Mixed prompt, cwd and actual platform agent metadata can share a batch inside one
+project and original session. Each memory cites its own source events. Missing or
+invalid source references preserve the paid reply and park the affected events
+for local inspection instead of automatically buying another request. Batch runs
+record actual event and summary counts, size, split reason and provider usage;
+the batch's cost is not repeated on every memory row.
+
 | Setting                                      | Default                     | Description                           |
 |----------------------------------------------|-----------------------------|---------------------------------------|
 | `CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS` | `400000`                    | Characters one observer generation may hold before it is retired |
+| `CLAUDE_MEM_CLAUDE_BATCH_V2_ENABLED` | `false` | Opt in to Claude batches with durable per-event source references. Requires the `summary_or_session_end` trigger; restart after changing. Other providers retain their current protocol. |
+| `CLAUDE_MEM_CLAUDE_BATCH_V2_MAX_CHARS` | `96000` | Total v2 input characters including framing, from `12000` to `96000`. Up to 16 tool events plus summaries per request, within the model window. Restart after changing. |
 | `CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW`         | —                           | Observer model context window in tokens. Empty = resolve it: Claude models `200000` (`1000000` for a `[1m]` model id), Gemini models from a built-in map, OpenRouter models from the OpenRouter models catalogue. Any other OpenAI-compatible endpoint (a local server, a custom gateway) falls back to `131072`, so set this for a model with a smaller window, e.g. `16384`. Values below `8192` are clamped up to `8192` |
 | `CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS`      | `4096`                      | Output-token cap on every OpenRouter, custom-endpoint and Gemini observer request (`max_tokens`, or `max_completion_tokens` for endpoints that require it; Gemini `maxOutputTokens`). Raise it for a reasoning model that spends the cap before it answers. `256`–`1000000` |
 | `CLAUDE_MEM_OBSERVE_BARE_PROMPTS`            | `false`                     | `false`: a user prompt is not sent to the observer on its own; it goes out with the next tool call or summary, in that request. `true`: one observer request per prompt, as before |

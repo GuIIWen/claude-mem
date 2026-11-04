@@ -845,6 +845,11 @@ export class WorkerService implements WorkerRef {
       await this.dbManager.initialize();
       // Shutdown may have begun while initialization was pending.
       if (this.isShuttingDown) return;
+      // Constructor-time route registration precedes DB initialization. Start
+      // the durable scheduler here, before hook-spool recovery can enqueue.
+      this.sessionManager.configureDeferredObserver(
+        this.dbManager.getConnection(), SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH),
+      );
 
       // Work View starts background refresh in its constructor. Keep every
       // read-only handle behind successful schema checks and migrations (#5127).

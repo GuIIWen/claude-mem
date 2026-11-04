@@ -29,3 +29,10 @@ export function isRecursiveMemoryTool(toolName: string): boolean {
 export function isExplicitMemoryWrite(toolName: string): boolean {
   return toolName === 'save_memory' || claudeMemToolName(toolName) === 'save_memory';
 }
+
+/** Filter the echo only, never the tool execution or its explicit storage. */
+export function isInternalMemoryObserverTool(toolName: string): boolean {
+  if (isRecursiveMemoryTool(toolName) || isExplicitMemoryWrite(toolName)) return true;
+  const tool = claudeMemToolName(toolName);
+  return tool !== null && (tool.startsWith('work_state_') || tool === 'tool_discovery');
+}

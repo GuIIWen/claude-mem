@@ -68,6 +68,46 @@ const OBSERVATION_SCHEMA_TAGS = new Set([
   'files_read', 'files_modified', 'file', 'attachments', 'attachment',
 ]);
 
+/** Explicit opt-in parser: legacy callers retain their first-root semantics. */
+export function parseAgentXmlV2(raw: string): {
+  observations: Array<{ value: ParsedObservation; sources: string[] }>;
+  summaries: Array<{ value: ParsedSummary; sources: string[] }>;
+  skipped: string[];
+} {
+  const observations: Array<{ value: ParsedObservation; sources: string[] }> = [];
+  const summaries: Array<{ value: ParsedSummary; sources: string[] }> = [];
+  const sources = (block: string): string[] => {
+    const matches = [...block.matchAll(/<source_event_ids>([\s\S]*?)<\/source_event_ids>/g)];
+    if (matches.length !== 1) throw new Error('attribution_error: missing or duplicate source_event_ids');
+    const body = matches[0][1];
+    const ids = [...body.matchAll(/<source>([^<>]+)<\/source>/g)].map(m => m[1].trim());
+    if (!ids.length || body.replace(/<source>[^<>]+<\/source>/g, '').trim()) throw new Error('attribution_error: invalid sources');
+    if (new Set(ids).size !== ids.length) throw new Error('attribution_error: duplicate source');
+    return ids;
+  };
+  for (const match of raw.matchAll(/<observation>([\s\S]*?)<\/observation>/g)) {
+    const parsed = parseAgentXml(match[0].replace(/<source_event_ids>[\s\S]*?<\/source_event_ids>/g, ''));
+    if (!parsed.valid || parsed.observations.length !== 1 || !parsed.observations[0].title?.trim() || parsed.schemaDrift?.length) {
+      throw new Error('attribution_error: invalid observation');
+    }
+    observations.push({ value: parsed.observations[0], sources: sources(match[1]) });
+  }
+  for (const match of raw.matchAll(/<summary>([\s\S]*?)<\/summary>/g)) {
+    const value = parseSummaryBlock(match[0]);
+    if (!value) throw new Error('attribution_error: invalid summary');
+    summaries.push({ value, sources: sources(match[1]) });
+  }
+  const skipBlocks = [...raw.matchAll(/<skipped_event_ids>([\s\S]*?)<\/skipped_event_ids>/g)];
+  if (skipBlocks.length > 1) throw new Error('attribution_error: duplicate skipped_event_ids');
+  const skipBody = skipBlocks[0]?.[1] ?? '';
+  const skipped = [...skipBody.matchAll(/<source>([^<>]+)<\/source>/g)].map(m => m[1].trim());
+  if (skipBody.replace(/<source>[^<>]+<\/source>/g, '').trim()) throw new Error('attribution_error: invalid skip');
+  // Reject unfinished/malformed records instead of salvaging a partial paid reply.
+  const rest = raw.replace(/<observation>[\s\S]*?<\/observation>|<summary>[\s\S]*?<\/summary>|<skipped_event_ids>[\s\S]*?<\/skipped_event_ids>/g, '');
+  if (/<\/?(?:observation|summary|source_event_ids|source|skip_summary)\b/.test(rest)) throw new Error('attribution_error: malformed output');
+  return { observations, summaries, skipped };
+}
+
 /**
  * docs/media-contract-v1.md "Observation XML attachment refs": lowercase tags,
  * matched case-sensitively (unlike every other field here), first block only.

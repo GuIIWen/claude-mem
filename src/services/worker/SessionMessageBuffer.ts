@@ -47,6 +47,10 @@ export interface DrainOptions {
  * single live generator pass (drop a stored batch; re-yield a batch that
  * couldn't be stored yet because the memory session id wasn't captured). They
  * never cross a process boundary.
+ *
+ * The opt-in DeferredObserverQueue sits OUTSIDE this buffer: only released
+ * boundary snapshots enter here. SessionManager maps these RAM IDs to durable
+ * outbox identities and quarantines uncertain sends instead of replaying them.
  */
 export class SessionMessageBuffer {
   private readonly buffers = new Map<number, BufferedMessage[]>();
@@ -63,7 +67,8 @@ export class SessionMessageBuffer {
    * and only against others in the same session for this worker's lifetime.
    */
   enqueue(sessionDbId: number, message: PendingMessage, enqueuedAt = Date.now()): number {
-    const toolUseId = message.toolUseId;
+    const toolUseId = message.toolUseId && message._fragmentIndex !== undefined
+      ? `${message.toolUseId}:fragment:${message._fragmentIndex}` : message.toolUseId;
     if (toolUseId) {
       const seen = this.getSeen(sessionDbId);
       if (seen.has(toolUseId)) {

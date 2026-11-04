@@ -238,6 +238,8 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CODEX_MAX_CONCURRENT_AGENTS: string;
   CLAUDE_MEM_CODEX_OBSERVATION_BATCH_SIZE: string;
   CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE: string;
+  CLAUDE_MEM_CLAUDE_BATCH_V2_ENABLED: string;
+  CLAUDE_MEM_CLAUDE_BATCH_V2_MAX_CHARS: string;
   CLAUDE_MEM_CODEX_OBSERVATION_BATCH_MAX_CHARS: string;
   CLAUDE_MEM_CLAUDE_AUTH_METHOD: string;  
   CLAUDE_MEM_GEMINI_API_KEY: string;
@@ -304,6 +306,9 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CODEX_SUBAGENT_INGESTION: string;
   CLAUDE_MEM_MAX_CONCURRENT_AGENTS: string;  
   CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS: string;
+  CLAUDE_MEM_OBSERVER_TRIGGER: string;
+  CLAUDE_MEM_OBSERVER_MAX_WAIT_MS: string;
+  CLAUDE_MEM_OBSERVER_SKIP_INTERNAL_TOOLS: string;
   CLAUDE_MEM_OBSERVER_THINKING: string;  // Observer thinking param: 'disabled' | 'adaptive' | 'enabled[:budget]' | 'omit' (#4732)
   CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW: string;  // Observer model context window in tokens; '' = resolve automatically
   CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS: string;  // Output-token cap on every HTTP observer request (OpenRouter, custom, gateway, Gemini)
@@ -518,6 +523,8 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CODEX_OBSERVATION_BATCH_SIZE: '8',
     CLAUDE_MEM_CODEX_OBSERVATION_BATCH_MAX_CHARS: '32000',
     CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE: '1', // Queued same-context events per Claude observer prompt (1-32). 1 = one event per prompt.
+    CLAUDE_MEM_CLAUDE_BATCH_V2_ENABLED: 'false', // Claude-only durable per-event attribution; deferred trigger required.
+    CLAUDE_MEM_CLAUDE_BATCH_V2_MAX_CHARS: '96000', // Total batch input, including protocol/init, before model-window tightening.
     CLAUDE_MEM_CLAUDE_AUTH_METHOD: 'subscription',  // Default to logged-in Claude SDK auth (not API key)
     CLAUDE_MEM_GEMINI_API_KEY: '',  // Empty by default, can be set via UI or env
     CLAUDE_MEM_GEMINI_API_KEYS: '',  // Optional extra keys (newline/comma separated). Rotates on rate_limit/quota_exhausted/auth_invalid — see src/shared/api-key-pool.ts.
@@ -590,6 +597,9 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CODEX_SUBAGENT_INGESTION: 'false',
     CLAUDE_MEM_MAX_CONCURRENT_AGENTS: '2',  // Max concurrent Claude SDK agent subprocesses
     CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS: '400000',  // Retire an observer conversation past this size and start a fresh generation (#3800)
+    CLAUDE_MEM_OBSERVER_TRIGGER: 'immediate', // Opt-in summary/session-end batching; applied at worker boot.
+    CLAUDE_MEM_OBSERVER_MAX_WAIT_MS: '1800000', // Absolute age of the oldest waiting event; 0 waits for a boundary forever.
+    CLAUDE_MEM_OBSERVER_SKIP_INTERNAL_TOOLS: 'false',
     CLAUDE_MEM_OBSERVER_THINKING: 'disabled',  // Observer thinking param: 'disabled' (shipped) | 'adaptive' | 'enabled[:budget]' | 'omit' — an always-thinking gateway upstream rejects 'disabled' with 400/1210 (#4732)
     CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW: '',  // Observer model context window in tokens; '' = resolve it (OpenRouter catalogue, Gemini/Claude maps). Lowers the budget above to half the window (#3625)
     CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS: '4096',  // max_tokens / max_completion_tokens / Gemini maxOutputTokens on every HTTP observer request (#3868)

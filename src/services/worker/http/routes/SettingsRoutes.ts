@@ -269,6 +269,11 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_OPENROUTER_REASONING_EFFORT',
       'CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW',
       'CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS',
+      'CLAUDE_MEM_OBSERVER_TRIGGER',
+      'CLAUDE_MEM_CLAUDE_BATCH_V2_ENABLED',
+      'CLAUDE_MEM_CLAUDE_BATCH_V2_MAX_CHARS',
+      'CLAUDE_MEM_OBSERVER_MAX_WAIT_MS',
+      'CLAUDE_MEM_OBSERVER_SKIP_INTERNAL_TOOLS',
       'CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER',
       'CLAUDE_MEM_QUOTA_FALLBACK_MODEL',
       'CLAUDE_MEM_QUOTA_FALLBACK_AUTH_METHOD',
@@ -358,6 +363,27 @@ export class SettingsRoutes extends BaseRouteHandler {
   });
 
   private validateSettings(settings: any): { valid: boolean; error?: string } {
+    if (settings.CLAUDE_MEM_CLAUDE_BATCH_V2_ENABLED !== undefined && !['true','false'].includes(settings.CLAUDE_MEM_CLAUDE_BATCH_V2_ENABLED)) {
+      return { valid: false, error: 'CLAUDE_MEM_CLAUDE_BATCH_V2_ENABLED must be true or false (restart required)' };
+    }
+    if (settings.CLAUDE_MEM_CLAUDE_BATCH_V2_MAX_CHARS !== undefined && (!/^\d+$/.test(String(settings.CLAUDE_MEM_CLAUDE_BATCH_V2_MAX_CHARS))
+      || Number(settings.CLAUDE_MEM_CLAUDE_BATCH_V2_MAX_CHARS) < 12000 || Number(settings.CLAUDE_MEM_CLAUDE_BATCH_V2_MAX_CHARS) > 96000)) {
+      return { valid: false, error: 'CLAUDE_MEM_CLAUDE_BATCH_V2_MAX_CHARS must be a whole number from 12000 to 96000 (restart required)' };
+    }
+    if (settings.CLAUDE_MEM_OBSERVER_TRIGGER !== undefined
+      && !['immediate', 'summary_or_session_end'].includes(settings.CLAUDE_MEM_OBSERVER_TRIGGER)) {
+      return { valid: false, error: 'CLAUDE_MEM_OBSERVER_TRIGGER must be immediate or summary_or_session_end (restart required)' };
+    }
+    if (settings.CLAUDE_MEM_OBSERVER_MAX_WAIT_MS !== undefined) {
+      const raw = String(settings.CLAUDE_MEM_OBSERVER_MAX_WAIT_MS).trim();
+      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) > 2_147_483_647) {
+        return { valid: false, error: 'CLAUDE_MEM_OBSERVER_MAX_WAIT_MS must be a whole number from 0 to 2147483647' };
+      }
+    }
+    if (settings.CLAUDE_MEM_OBSERVER_SKIP_INTERNAL_TOOLS !== undefined
+      && !['true', 'false'].includes(settings.CLAUDE_MEM_OBSERVER_SKIP_INTERNAL_TOOLS)) {
+      return { valid: false, error: 'CLAUDE_MEM_OBSERVER_SKIP_INTERNAL_TOOLS must be true or false' };
+    }
     for (const key of ['CLAUDE_MEM_CODEX_MODEL', 'CLAUDE_MEM_CODEX_REASONING_EFFORT'] as const) {
       if (settings[key] !== undefined && typeof settings[key] !== 'string') {
         return { valid: false, error: `${key} must be a string` };
