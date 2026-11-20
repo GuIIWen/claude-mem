@@ -9,6 +9,7 @@ import { isOpenRouterApiUrl } from './openrouter-base-url.js';
 import { settingsTarget, withoutStaleRootCopies } from './settings-document.js';
 import { expandHome } from './expand-home.js';
 import { getDefaultServerPort, getDefaultWorkerPort } from './install-port.js';
+import { DEFAULT_OBSERVER_MAX_WAIT_MS, OBSERVER_TRIGGERS } from './observer-scheduling.js';
 
 // A fresh settings.json is seeded with EVERY default (see loadFromFile), and
 // persisted values then win over DEFAULTS. So any install created after the
@@ -266,6 +267,8 @@ export interface SettingsDefaults {
   CLAUDE_MEM_PROVIDER: string;
   CLAUDE_MEM_PROVIDER_BY_SOURCE: string;          // JSON object mapping a platform source to a provider, e.g. {"codex":"codex"}; empty = off, global provider for every source
   CLAUDE_MEM_OBSERVER_ENABLED: string;
+  CLAUDE_MEM_OBSERVER_TRIGGER: string;
+  CLAUDE_MEM_OBSERVER_MAX_WAIT_MS: string;
   CLAUDE_MEM_MEDIA_CAPTURE_ENABLED: string;
   CLAUDE_MEM_MEDIA_INFERENCE_ENABLED: string;
   CLAUDE_MEM_CODEX_MODEL: string;
@@ -577,6 +580,8 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_PROVIDER: 'claude',
     CLAUDE_MEM_PROVIDER_BY_SOURCE: '',
     CLAUDE_MEM_OBSERVER_ENABLED: 'true',  // 'false' disables new observation and session-summary capture calls
+    CLAUDE_MEM_OBSERVER_TRIGGER: OBSERVER_TRIGGERS[0],
+    CLAUDE_MEM_OBSERVER_MAX_WAIT_MS: String(DEFAULT_OBSERVER_MAX_WAIT_MS),
     // Image capture is on: the viewer's "Keep images" switch turns it off.
     // No total local cap, by the owner's call (2026-11-05): each image is
     // bounded (MEDIA_LIMITS in media-contract.ts: 3 MiB canonical, 256 KiB
@@ -592,7 +597,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CODEX_MAX_CONCURRENT_AGENTS: '2',
     CLAUDE_MEM_CODEX_OBSERVATION_BATCH_SIZE: '8',
     CLAUDE_MEM_CODEX_OBSERVATION_BATCH_MAX_CHARS: '32000',
-    CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE: '1', // Queued same-context events per Claude observer prompt (1-32). 1 = one event per prompt.
+    CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE: '16', // Configurable same-context events per Claude prompt (1-32), not a send threshold.
     CLAUDE_MEM_CLAUDE_AUTH_METHOD: 'subscription',  // Default to logged-in Claude SDK auth (not API key)
     CLAUDE_MEM_GEMINI_API_KEY: '',  // Empty by default, can be set via UI or env
     CLAUDE_MEM_GEMINI_API_KEYS: '',  // Optional extra keys (newline/comma separated). Rotates on rate_limit/quota_exhausted/auth_invalid — see src/shared/api-key-pool.ts.

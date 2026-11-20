@@ -67,6 +67,7 @@ function makeSession(): ActiveSession {
 function makeHarness() {
   const session = makeSession();
   let pendingCount = 0;
+  let deferred = false;
   const openRouterStartSession = mock(async () => {});
   const clearUnclaimed = mock(() => {
     const cleared = pendingCount;
@@ -77,6 +78,7 @@ function makeHarness() {
     getSession: mock((id: number) => (id === session.sessionDbId ? session : undefined)),
     getMessageBuffer: mock(() => ({
       getPendingCount: () => pendingCount,
+      getReadyCount: () => deferred ? 0 : pendingCount,
       peekTypes: () => [] as Array<{ message_type: string }>,
       clearUnclaimed,
     })),
@@ -99,6 +101,8 @@ function makeHarness() {
     clearUnclaimed,
     pendingCount: () => pendingCount,
     enqueue: () => { pendingCount += 1; },
+    defer: () => { deferred = true; },
+    release: () => { deferred = false; },
   };
 }
 
@@ -144,6 +148,21 @@ describe('SessionRoutes.ensureGeneratorRunning — empty-queue start gate (#3454
     await harness.session.generatorPromise;
 
     expect(providerSelections).toBe(1);
+    expect(harness.openRouterStartSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('held events do not select a provider until a boundary releases them', async () => {
+    const harness = makeHarness();
+    harness.defer();
+    harness.enqueue();
+    for (const source of ['observation', 'init', 'periodic-resume', 'transport-resume']) {
+      await harness.routes.ensureGeneratorRunning(harness.session.sessionDbId, source);
+    }
+    expect(providerSelections).toBe(0);
+    expect(harness.openRouterStartSession).not.toHaveBeenCalled();
+    harness.release();
+    await harness.routes.ensureGeneratorRunning(harness.session.sessionDbId, 'summarize');
+    await harness.session.generatorPromise;
     expect(harness.openRouterStartSession).toHaveBeenCalledTimes(1);
   });
 

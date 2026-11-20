@@ -4,6 +4,7 @@ import { SessionManager } from './SessionManager.js';
 import { logger } from '../../utils/logger.js';
 import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
+import { observerWaitMs } from '../../shared/observer-scheduling.js';
 import { USER_SETTINGS_PATH, OBSERVER_WORKING_DIRECTORY_ERROR_PREFIX, paths } from '../../shared/paths.js';
 import {
   buildIsolatedEnvWithFreshOAuth,
@@ -1378,7 +1379,47 @@ export class ClaudeProvider {
           created_at_epoch: Date.now(),
           cwd: message.cwd
         }, fieldMaxChars, takeObserverSchemaReminder(session));
-        const batchPrompt = this.withQueuedObservations(session, message, obsPrompt, fieldMaxChars);
+        const initialClaimCount = session.claimedMessageIds.length;
+        let batchPrompt = this.withQueuedObservations(session, message, obsPrompt, fieldMaxChars);
+        let summaryIncluded = false;
+        const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+        // Merge only an adjacent parent checkpoint from the same turn, within
+        // the existing size budget and on the same model. Other providers and
+        // per-observation mode retain their existing summary protocol.
+        if (observerWaitMs(settings) !== undefined && !message.agentId && !message.agentType
+          && (!session.lastModelId || session.lastModelId === this.getSummaryModelId())) {
+          let combined = '';
+          const summary = this.sessionManager.claimNextSummary?.(session.sessionDbId, candidate => {
+            if ((candidate.prompt_number ?? session.lastPromptNumber)
+              !== (message.prompt_number ?? session.lastPromptNumber)) return false;
+            const summaryPrompt = buildSummaryPrompt({
+              id: session.sessionDbId,
+              memory_session_id: session.memorySessionId,
+              project: session.project,
+              user_prompt: session.userPrompt,
+              last_assistant_message: candidate.last_assistant_message || '',
+            }, mode, { includeObservations: true });
+            combined = `${batchPrompt}\n\n${summaryPrompt}`;
+            return combined.length <= 2 * fieldMaxChars;
+          });
+          if (summary) {
+            batchPrompt = combined;
+            summaryIncluded = true;
+          }
+        }
+        // Include every claimed input in the response's source snapshot.
+        activeResponseContext.current = {
+          ...snapshotResponseContext(session),
+          promptNumber: message.prompt_number ?? session.lastPromptNumber,
+          allowMixed: summaryIncluded,
+        };
+        logger.info('SDK', 'Observer batch ready', {
+          sessionId: session.sessionDbId,
+          observations: 1 + session.claimedMessageIds.length - initialClaimCount - Number(summaryIncluded),
+          batchLimit: boundedInteger(settings.CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE, 1, 32),
+          summaryIncluded,
+          payloadChars: batchPrompt.length,
+        });
 
         session.conversationHistory.push({ role: 'user', content: batchPrompt });
 

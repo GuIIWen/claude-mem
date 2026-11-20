@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { createHash } from 'node:crypto';
 import type { PendingMessage, PendingMessageWithId } from '../worker-types.js';
 import { logger } from '../../utils/logger.js';
 import { LIVE_OBSERVER_MAX_AGE_MS, LIVE_OBSERVER_MAX_SESSION_MESSAGES, LIVE_OBSERVER_MAX_TOTAL_MESSAGES } from '../../shared/observer-work-policy.js';
@@ -27,6 +28,13 @@ interface BufferedMessage {
   parkedClientAttemptId?: string;
   enqueuedAt: number;
   bufferedAt: number;
+  /** Live input awaiting a turn/session boundary; never persisted for replay. */
+  deferred: boolean;
+}
+
+export interface MessageBufferScheduling {
+  observationWaitMs?: () => number | undefined;
+  onReady?: (sessionDbId: number, source: string) => void;
 }
 
 export interface DrainOptions {
@@ -69,8 +77,14 @@ export class SessionMessageBuffer {
   private readonly events = new Map<number, EventEmitter>();
   private readonly seenToolUseIds = new Map<number, Set<string>>();
   private nextId = 1;
+  private readonly releaseTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  private readonly lastObservationIds = new Map<number, number>();
+  private readonly lastSummaryKeys = new Map<number, string>();
 
-  constructor(private readonly onMutate?: () => void) {}
+  constructor(
+    private readonly onMutate?: () => void,
+    private readonly scheduling: MessageBufferScheduling = {},
+  ) {}
 
   /**
    * Append a message. Returns its id, or 0 for a duplicate/full buffer.
@@ -80,6 +94,16 @@ export class SessionMessageBuffer {
    */
   enqueue(sessionDbId: number, message: PendingMessage, enqueuedAt = Date.now()): number {
     this.pruneExpired();
+    const waitMs = this.scheduling.observationWaitMs?.();
+    const summaryKey = message.type === 'summarize' && waitMs !== undefined
+      ? createHash('sha256').update(JSON.stringify([
+        message.prompt_number, message.last_assistant_message, this.lastObservationIds.get(sessionDbId),
+      ])).digest('hex') : undefined;
+    // Re-delivering the same Stop, with no new source events, is not a new
+    // paid checkpoint. Keep only its digest, never another payload queue.
+    if (summaryKey && this.lastSummaryKeys.get(sessionDbId) === summaryKey) return 0;
+    // A full buffer must still release at Stop even if its summary cannot fit.
+    if (message.type === 'summarize') this.releaseDeferred(sessionDbId, 'summary');
     const toolUseId = message.toolUseId;
     if (toolUseId) {
       const seen = this.getSeen(sessionDbId);
@@ -98,10 +122,54 @@ export class SessionMessageBuffer {
     if (toolUseId) this.getSeen(sessionDbId).add(toolUseId);
 
     const id = this.nextId++;
-    this.getList(sessionDbId).push({ id, message, claimed: false, parked: false, enqueuedAt, bufferedAt: Date.now() });
+    const deferred = message.type === 'observation' && waitMs !== undefined;
+    this.getList(sessionDbId).push({ id, message, claimed: false, parked: false, enqueuedAt, bufferedAt: Date.now(), deferred });
+    if (message.type === 'observation') this.lastObservationIds.set(sessionDbId, id);
+    if (summaryKey) this.lastSummaryKeys.set(sessionDbId, summaryKey);
+    // One timer starts with the first held event, not the most recent one.
+    if (deferred && !this.releaseTimers.has(sessionDbId)) {
+      logger.info('QUEUE', 'Waiting for an observer boundary', { sessionId: sessionDbId, maxWaitMs: waitMs });
+      const timer = setTimeout(() => {
+        if (this.releaseTimers.get(sessionDbId) !== timer) return;
+        this.releaseDeferred(sessionDbId, 'observer-max-wait');
+      }, waitMs);
+      timer.unref?.();
+      this.releaseTimers.set(sessionDbId, timer);
+    }
     this.onMutate?.();
-    this.signal(sessionDbId);
+    if (!deferred) this.signal(sessionDbId);
     return id;
+  }
+
+  /** Release only this session's current live inputs; future events stay held. */
+  releaseDeferred(sessionDbId: number, source: string): number {
+    this.clearReleaseTimer(sessionDbId);
+    this.pruneExpired();
+    let released = 0;
+    for (const message of this.buffers.get(sessionDbId) ?? []) {
+      if (message.deferred && !message.parked && !message.claimed) {
+        message.deferred = false;
+        released++;
+      }
+    }
+    if (released > 0) {
+      logger.info('QUEUE', 'Released live observer batch', { sessionId: sessionDbId, source, released });
+      this.onMutate?.();
+      this.signal(sessionDbId);
+      this.scheduling.onReady?.(sessionDbId, source);
+    }
+    return released;
+  }
+
+  getReadyCount(sessionDbId: number): number {
+    this.pruneExpired();
+    return (this.buffers.get(sessionDbId) ?? []).filter(m => !m.parked && !m.deferred).length;
+  }
+
+  private clearReleaseTimer(sessionDbId: number): void {
+    const timer = this.releaseTimers.get(sessionDbId);
+    if (timer !== undefined) clearTimeout(timer);
+    this.releaseTimers.delete(sessionDbId);
   }
 
   /** Remove a stored message by id. Returns 1 if found, 0 otherwise. */
@@ -163,6 +231,9 @@ export class SessionMessageBuffer {
 
   /** Drop everything buffered for a session. */
   clear(sessionDbId: number): number {
+    this.clearReleaseTimer(sessionDbId);
+    this.lastObservationIds.delete(sessionDbId);
+    this.lastSummaryKeys.delete(sessionDbId);
     const cleared = this.buffers.get(sessionDbId)?.length ?? 0;
     this.buffers.delete(sessionDbId);
     // Mirror dispose(): drop the dedup set too. Otherwise a clear() not followed
@@ -181,6 +252,7 @@ export class SessionMessageBuffer {
    * again by a later hook or transcript replay (#5405).
    */
   discardKeepingDedup(sessionDbId: number): number {
+    this.clearReleaseTimer(sessionDbId);
     const discarded = this.buffers.get(sessionDbId)?.length ?? 0;
     this.buffers.delete(sessionDbId);
     if (discarded > 0) this.onMutate?.();
@@ -193,6 +265,7 @@ export class SessionMessageBuffer {
    * authorize another send of a completed, parked, or discarded event.
    */
   clearUnclaimed(sessionDbId: number): number {
+    this.clearReleaseTimer(sessionDbId);
     const list = this.buffers.get(sessionDbId);
     if (!list) return 0;
     const kept = list.filter(message => message.claimed);
@@ -211,6 +284,9 @@ export class SessionMessageBuffer {
 
   /** Forget a session entirely (buffer, dedup set, event emitter). */
   dispose(sessionDbId: number): void {
+    this.clearReleaseTimer(sessionDbId);
+    this.lastObservationIds.delete(sessionDbId);
+    this.lastSummaryKeys.delete(sessionDbId);
     this.buffers.delete(sessionDbId);
     this.seenToolUseIds.delete(sessionDbId);
     this.events.get(sessionDbId)?.removeAllListeners();
@@ -321,7 +397,7 @@ export class SessionMessageBuffer {
   claimNextMatching(sessionDbId: number, accepts: (message: PendingMessageWithId) => boolean): PendingMessageWithId | null {
     this.pruneExpired();
     const next = this.buffers.get(sessionDbId)?.find(message => !message.claimed && !message.parked);
-    if (!next) return null;
+    if (!next || next.deferred) return null;
     const message = { ...next.message, _persistentId: next.id, _originalTimestamp: next.enqueuedAt };
     if (!accepts(message)) return null;
     next.claimed = true;
@@ -334,7 +410,7 @@ export class SessionMessageBuffer {
     const list = this.buffers.get(sessionDbId);
     if (!list) return null;
     const next = list.find(m => !m.claimed && !m.parked);
-    if (!next) return null;
+    if (!next || next.deferred) return null;
     next.claimed = true;
     this.onMutate?.();
     return next;
@@ -354,6 +430,7 @@ export class SessionMessageBuffer {
       const live = list.filter(message => message.claimed || message.bufferedAt > cutoff);
       skipped += list.length - live.length;
       if (live.length !== list.length) this.buffers.set(sessionDbId, live);
+      if (!live.some(message => message.deferred && !message.parked)) this.clearReleaseTimer(sessionDbId);
     }
     if (skipped > 0) {
       logger.warn('QUEUE', 'Skipped expired live observer inputs; no replay scheduled', { skipped });

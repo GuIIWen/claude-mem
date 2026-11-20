@@ -710,6 +710,7 @@ export async function ingestSessionEnd(
     return { status: 'unknown_session' };
   }
 
+  deps.sessionManager.releaseDeferredObservations?.(sessionDbId, 'session-end');
   await deps.sessionManager.requestSessionWrapup(sessionDbId);
   // Wrap-up requested (no provider-bound work follows here).
   handoff.markHandedOff?.();

@@ -111,6 +111,7 @@ async function claimFirstObservation(h: ReturnType<typeof createHarness>) {
 
 let liveSessions: ActiveSession[] = [];
 let previousObserveBarePrompts: string | undefined;
+let previousObservationBatchSize: string | undefined;
 
 beforeEach(() => {
   sdkFixture.currentSdk = null;
@@ -120,6 +121,10 @@ beforeEach(() => {
   // A separate init turn makes "init failed" and "between turns" expressible.
   previousObserveBarePrompts = process.env.CLAUDE_MEM_OBSERVE_BARE_PROMPTS;
   process.env.CLAUDE_MEM_OBSERVE_BARE_PROMPTS = 'true';
+  // These pacing probes need separate tool turns. Batching behavior is
+  // exercised explicitly below and in claude-observation-batch.test.ts.
+  previousObservationBatchSize = process.env.CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE;
+  process.env.CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE = '1';
 });
 
 afterEach(() => {
@@ -128,6 +133,8 @@ afterEach(() => {
   for (const session of liveSessions) session.abortController.abort();
   if (previousObserveBarePrompts === undefined) delete process.env.CLAUDE_MEM_OBSERVE_BARE_PROMPTS;
   else process.env.CLAUDE_MEM_OBSERVE_BARE_PROMPTS = previousObserveBarePrompts;
+  if (previousObservationBatchSize === undefined) delete process.env.CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE;
+  else process.env.CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE = previousObservationBatchSize;
 });
 
 describe('work preservation — a failed result frame', () => {

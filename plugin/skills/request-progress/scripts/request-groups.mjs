@@ -903,6 +903,27 @@ var init_openrouter_base_url = __esm({
   }
 });
 
+// src/shared/observer-work-policy.ts
+var LIVE_OBSERVER_MAX_AGE_MS;
+var init_observer_work_policy = __esm({
+  "src/shared/observer-work-policy.ts"() {
+    "use strict";
+    LIVE_OBSERVER_MAX_AGE_MS = 5 * 6e4;
+  }
+});
+
+// src/shared/observer-scheduling.ts
+var OBSERVER_TRIGGERS, DEFAULT_OBSERVER_MAX_WAIT_MS, MAX_OBSERVER_WAIT_MS;
+var init_observer_scheduling = __esm({
+  "src/shared/observer-scheduling.ts"() {
+    "use strict";
+    init_observer_work_policy();
+    OBSERVER_TRIGGERS = ["per_observation", "summary_or_session_end"];
+    DEFAULT_OBSERVER_MAX_WAIT_MS = 6e4;
+    MAX_OBSERVER_WAIT_MS = LIVE_OBSERVER_MAX_AGE_MS - 6e4;
+  }
+});
+
 // src/shared/SettingsDefaultsManager.ts
 import { readFileSync as readFileSync5, existsSync as existsSync7, writeFileSync } from "fs";
 import { basename as basename3, dirname as dirname4, join as join8 } from "path";
@@ -973,6 +994,7 @@ var init_SettingsDefaultsManager = __esm({
     init_settings_document();
     init_expand_home();
     init_install_port();
+    init_observer_scheduling();
     LEGACY_TELEGRAM_TRIGGER_TYPES = "security_alert";
     LEGACY_CLOUD_SYNC_HUB_HOST = "sync-hub.black-pond-afbb.workers.dev";
     DIRECT_SUPABASE_CLOUD_SYNC_HUB_HOST = "ziczmqtpmaxbornfghye.supabase.co";
@@ -1062,6 +1084,8 @@ var init_SettingsDefaultsManager = __esm({
         CLAUDE_MEM_PROVIDER_BY_SOURCE: "",
         CLAUDE_MEM_OBSERVER_ENABLED: "true",
         // 'false' disables new observation and session-summary capture calls
+        CLAUDE_MEM_OBSERVER_TRIGGER: OBSERVER_TRIGGERS[0],
+        CLAUDE_MEM_OBSERVER_MAX_WAIT_MS: String(DEFAULT_OBSERVER_MAX_WAIT_MS),
         // Image capture is on: the viewer's "Keep images" switch turns it off.
         // No total local cap, by the owner's call (2026-11-05): each image is
         // bounded (MEDIA_LIMITS in media-contract.ts: 3 MiB canonical, 256 KiB
@@ -1078,8 +1102,8 @@ var init_SettingsDefaultsManager = __esm({
         CLAUDE_MEM_CODEX_MAX_CONCURRENT_AGENTS: "2",
         CLAUDE_MEM_CODEX_OBSERVATION_BATCH_SIZE: "8",
         CLAUDE_MEM_CODEX_OBSERVATION_BATCH_MAX_CHARS: "32000",
-        CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE: "1",
-        // Queued same-context events per Claude observer prompt (1-32). 1 = one event per prompt.
+        CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE: "16",
+        // Configurable same-context events per Claude prompt (1-32), not a send threshold.
         CLAUDE_MEM_CLAUDE_AUTH_METHOD: "subscription",
         // Default to logged-in Claude SDK auth (not API key)
         CLAUDE_MEM_GEMINI_API_KEY: "",

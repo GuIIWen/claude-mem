@@ -291,8 +291,10 @@ export class SessionRoutes extends BaseRouteHandler {
     // method. Resume sources (overflow-recycle, response-stall, rate-limit,
     // cmem-fallback, the periodic sweep) pass the same gate: with nothing
     // buffered there is nothing to resume.
-    if (this.sessionManager.getMessageBuffer().getPendingCount(sessionDbId) === 0) {
-      logger.debug('SESSION', 'Skipping generator start with an empty queue', { sessionId: sessionDbId, source });
+    const buffer = this.sessionManager.getMessageBuffer();
+    const readyCount = buffer.getReadyCount?.(sessionDbId) ?? buffer.getPendingCount(sessionDbId);
+    if (readyCount === 0) {
+      logger.debug('SESSION', 'Skipping generator start without released live work', { sessionId: sessionDbId, source });
       return;
     }
 

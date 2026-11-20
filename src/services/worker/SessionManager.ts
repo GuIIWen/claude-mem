@@ -16,6 +16,7 @@ import { claudeStandInStillServes } from '../../shared/claude-fallback-readiness
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { isObserverCaptureEnabled } from '../../shared/observer-capture.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
+import { observerWaitMs, OBSERVER_TRIGGER_LABELS, OBSERVER_TRIGGERS } from '../../shared/observer-scheduling.js';
 
 export const SESSION_END_WRAPUP_GRACE_MS = 5_000;
 
@@ -54,7 +55,20 @@ export class SessionManager {
   private sessions: Map<number, ActiveSession> = new Map();
   private onPendingMutate?: () => void;
   private telegramWrapupFormatter: TelegramWrapupFormatter | null = null;
-  private readonly buffer = new SessionMessageBuffer(() => this.onPendingMutate?.());
+  private readonly buffer = new SessionMessageBuffer(() => this.onPendingMutate?.(), {
+    observationWaitMs: () => observerWaitMs(SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH)),
+    onReady: (sessionDbId, source) => {
+      logger.debug('SESSION', OBSERVER_TRIGGER_LABELS[OBSERVER_TRIGGERS[1]], { sessionId: sessionDbId, source });
+      // Queueing stays synchronous. A boundary's handoff completes before
+      // this kick, and discarded/deleted inputs can never be revived by it.
+      void Promise.resolve().then(() => {
+        if (!this.sessions.has(sessionDbId) || this.deletingSessions.has(sessionDbId)
+          || this.buffer.getReadyCount(sessionDbId) === 0) return;
+        return this.generatorStarter?.(sessionDbId, source);
+      }).catch(error => logger.error('SESSION', 'Failed to start released live observer work',
+        { sessionId: sessionDbId, source }, error instanceof Error ? error : new Error(String(error))));
+    },
+  });
   private generatorStarter: ((sessionDbId: number, source: string) => void | Promise<void>) | null = null;
   private transportResumes = new Map<number, TransportResumeState>();
   private transportResumeReady: ReadyTransportResume[] = [];
@@ -79,6 +93,10 @@ export class SessionManager {
 
   setGeneratorStarter(starter: (sessionDbId: number, source: string) => void | Promise<void>): void {
     this.generatorStarter = starter;
+  }
+
+  releaseDeferredObservations(sessionDbId: number, source: string): number {
+    return this.buffer.releaseDeferred(sessionDbId, source);
   }
 
   /**
@@ -1004,6 +1022,19 @@ export class SessionManager {
       candidate => candidate.type === 'observation'
         && !this.leavesSimpleTier(session, candidate)
         && accepts(candidate));
+    if (message) {
+      session.claimedMessageIds.push(message._persistentId);
+      session.earliestPendingTimestamp = Math.min(session.earliestPendingTimestamp ?? message._originalTimestamp, message._originalTimestamp);
+    }
+    return message;
+  }
+
+  /** A same-turn parent summary can share the final observation request. */
+  claimNextSummary(sessionDbId: number, accepts: (message: PendingMessageWithId) => boolean): PendingMessageWithId | null {
+    const session = this.sessions.get(sessionDbId);
+    if (!session || session.abortController.signal.aborted) return null;
+    const message = this.buffer.claimNextMatching(sessionDbId,
+      candidate => candidate.type === 'summarize' && accepts(candidate));
     if (message) {
       session.claimedMessageIds.push(message._persistentId);
       session.earliestPendingTimestamp = Math.min(session.earliestPendingTimestamp ?? message._originalTimestamp, message._originalTimestamp);

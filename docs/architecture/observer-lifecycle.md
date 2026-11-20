@@ -20,6 +20,11 @@ Unsent inputs expire after five minutes. An in-flight paid request may finish;
 the expiry does not abort it. Releasing a failed claim does not reset its age.
 Source timestamps stay separate from time spent in the buffer.
 
+Opt-in [deferred batching](deferred-observer-batching.md) may hold these same
+live inputs until a summary/session boundary or a short timer. Its wait is
+bounded ahead of the existing five-minute expiry; it does not persist inputs,
+extend their age, or resume discarded work after restart or quota/auth failure.
+
 The common hook handoff sends observations, file edits, and summaries directly
 to the existing worker endpoints, with a transport deadline
 (`CLAUDE_MEM_HOOK_HANDOFF_TIMEOUT_MS`, 250 ms by default, at most 14000 ms) and no

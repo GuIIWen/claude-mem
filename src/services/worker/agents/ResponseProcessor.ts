@@ -361,6 +361,8 @@ export interface ResponseContext {
   promptNumber: number;
   pendingAgentId: string | null;
   pendingAgentType: string | null;
+  /** Frozen at dispatch: a later settings edit cannot change this reply's protocol. */
+  allowMixed?: boolean;
   /**
    * The turn's source events and its request label -> (event_key,
    * attachment_id, event_label) map, frozen when the request was sent. Batch
@@ -733,7 +735,7 @@ export async function processAgentResponse(
     session.conversationHistory.push({ role: 'assistant', content: text });
   }
 
-  const parsed = parseAgentXml(text, session.contentSessionId);
+  const parsed = parseAgentXml(text, session.contentSessionId, { allowMixed: context.allowMixed === true });
 
   // Provider enum for telemetry, derived once so the invalid-output and
   // success paths stamp the same value.
@@ -991,8 +993,13 @@ export async function processAgentResponse(
       reason: 'missing_progress_content',
       ...(finishReason ? { finishReason, truncated: isOutputCapFinishReason(finishReason) } : {}),
     });
-    await confirmWithoutStorage(session, context, dbManager, sessionManager, worker);
-    return null;
+    if (parsed.observations.length === 0) {
+      await confirmWithoutStorage(session, context, dbManager, sessionManager, worker);
+      return null;
+    }
+    // A content-poor checkpoint must not discard valid observations from
+    // the same combined, already-answered batch.
+    parsed.summary = null;
   }
 
   // A reply cut off at the output-token cap can still hold complete blocks.

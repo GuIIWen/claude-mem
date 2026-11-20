@@ -474,7 +474,11 @@ Never reply with an empty response, or with prose such as "Skipping", "No substa
 export const OBSERVATION_SCHEMA_REMINDER =
   'Your previous reply used tags outside the observation format. Use only <type>, <title>, <subtitle>, <facts>, <narrative>, <concepts>, <files_read> and <files_modified> inside each <observation>.';
 
-export function buildSummaryPrompt(session: SDKSession, mode: ModeConfig): string {
+export function buildSummaryPrompt(
+  session: SDKSession,
+  mode: ModeConfig,
+  options: { includeObservations?: boolean } = {},
+): string {
   const lastAssistantMessage = session.last_assistant_message || (() => {
     logger.error('SDK', 'Missing last_assistant_message in session for summary prompt', {
       sessionId: session.id
@@ -484,9 +488,10 @@ export function buildSummaryPrompt(session: SDKSession, mode: ModeConfig): strin
 
   return `--- ${SUMMARY_MODE_MARKER} ---
 ⚠️ CRITICAL TAG REQUIREMENT — READ CAREFULLY:
-• You MUST wrap your ENTIRE response in <summary>...</summary> tags.
+${options.includeObservations ? `• First return any durable <observation>...</observation> blocks for the tool events above, then one <summary>...</summary> for this checkpoint.
+• Both observation and summary root blocks are accepted in this combined request. Keep their existing inner schemas; do not wrap them in another tag.` : `• You MUST wrap your ENTIRE response in <summary>...</summary> tags.
 • Do NOT use <observation> tags. <observation> output will be DISCARDED and cause a system error.
-• The ONLY accepted root tag is <summary>. Any other root tag is a protocol violation.
+• The ONLY accepted root tag is <summary>. Any other root tag is a protocol violation.`}
 
 ${getPrompt(mode, 'header_summary_checkpoint')}
 ${getPrompt(mode, 'summary_instruction')}
@@ -504,7 +509,9 @@ ${getPrompt(mode, 'summary_format_instruction')}
   <notes>${getPrompt(mode, 'xml_summary_notes_placeholder')}</notes>
 </summary>
 
-REMINDER: Your response MUST use <summary> as the root tag, NOT <observation>.
+${options.includeObservations
+    ? 'REMINDER: Return durable <observation> blocks followed by a <summary> checkpoint. These combined-request instructions supersede earlier observation-only or summary-only instructions.'
+    : 'REMINDER: Your response MUST use <summary> as the root tag, NOT <observation>.'}
 Include known progress in at least one of <investigated>, <learned>, <completed>, or <notes>. Neither <request> nor <next_steps>, alone or together, counts as progress. Do not invent progress to fill fields; notes-only summaries are accepted.
 If there is genuinely nothing to summarize, reply with exactly <skip_summary reason="nothing durable" /> instead of an empty response or prose.
 ${getPrompt(mode, 'summary_footer')}`;

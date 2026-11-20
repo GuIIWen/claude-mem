@@ -167,7 +167,11 @@ export function summaryFieldsHaveText(
   });
 }
 
-export function parseAgentXml(raw: string, correlationId?: string | number): ParseResult {
+export function parseAgentXml(
+  raw: string,
+  correlationId?: string | number,
+  options: { allowMixed?: boolean } = {},
+): ParseResult {
   if (typeof raw !== 'string' || !raw.trim()) {
     return { valid: false };
   }
@@ -177,7 +181,7 @@ export function parseAgentXml(raw: string, correlationId?: string | number): Par
   const markup = maskXmlLiteralMarkup(raw);
   const firstRoot = /<(observation|summary)\b/i.exec(markup);
   const skipMatch = SKIP_SUMMARY_TAG.exec(markup);
-  if (skipMatch && (!firstRoot || skipMatch.index < firstRoot.index)) {
+  if (skipMatch && (!firstRoot || (!options.allowMixed && skipMatch.index < firstRoot.index))) {
     const originalSkip = SKIP_SUMMARY_TAG.exec(raw.slice(skipMatch.index, skipMatch.index + skipMatch[0].length))!;
     const reason = originalSkip[1] ?? originalSkip[2];
     return {
@@ -198,6 +202,29 @@ export function parseAgentXml(raw: string, correlationId?: string | number): Par
 
   if (!firstRoot) {
     return { valid: false };
+  }
+
+  // Only an explicitly combined request may store both kinds. Legacy
+  // observation-only/summary-only turns retain their first-root semantics.
+  if (options.allowMixed) {
+    const schemaDrift = new Set<string>();
+    const observations: ParsedObservation[] = [];
+    let summary: ParsedSummary | null = null;
+    // Consume complete sibling roots so a summary example inside an
+    // observation (or an observation inside summary notes) is not a new record.
+    const roots = new RegExp(`${OBSERVATION_BLOCK.source}|${SUMMARY_BLOCK.source}`, 'gi');
+    let block: RegExpExecArray | null;
+    while ((block = roots.exec(markup)) !== null) {
+      const source = raw.slice(block.index, block.index + block[0].length);
+      if (/^<observation\b/i.test(block[0])) {
+        observations.push(...parseObservationBlocks(source, correlationId, schemaDrift));
+      } else if (!summary) {
+        summary = parseSummaryBlock(source, correlationId);
+      }
+    }
+    if (observations.length === 0 && !summary) return { valid: false };
+    return { valid: true, observations, summary,
+      ...(schemaDrift.size > 0 ? { schemaDrift: [...schemaDrift].sort() } : {}) };
   }
 
   const rootName = firstRoot[1].toLowerCase();
